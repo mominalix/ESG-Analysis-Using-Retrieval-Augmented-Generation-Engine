@@ -33,7 +33,7 @@ This repository contains a Python-based tool that leverages Large Language Model
 
 2.  Install dependencies:
     ```bash
-    cd esg-policy-analyzer
+    cd ai-powered-esg-compliance
     pip install -r requirements.txt 
     ```
 
