@@ -28,7 +28,7 @@ This repository contains a Python-based tool that leverages Large Language Model
 
 1.  Clone this repository:
     ```bash
-    git clone [https://github.com/](https://github.com/)mominalix/esg-policy-analyzer.git
+    git clone https://github.com/mominalix/ai-powered-esg-compliance.git
     ```
 
 2.  Install dependencies:
