@@ -39,11 +39,11 @@ This repository contains a Python-based tool that leverages Large Language Model
 
 **Running the Tool**
 
-1.  Set your API keys in the `ESG assessment.py` file or as environment variables.
+1.  Set your API keys in the `ESG_assessment.py` file or as environment variables.
 2.  Prepare your regulations data in the supported format.
 3.  Start the Streamlit application:
     ```bash
-    streamlit run ESGassessment.py
+    streamlit run ESG_assessment.py
     ```
 
 **Usage**
