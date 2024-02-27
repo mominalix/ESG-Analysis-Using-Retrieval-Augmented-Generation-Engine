@@ -2,6 +2,7 @@ import os
 import tempfile
 import pinecone
 import openai
+import mysql.connector
 from pathlib import Path
 from langchain.chains import RetrievalQA, ConversationalRetrievalChain
 from langchain.embeddings import OpenAIEmbeddings
@@ -14,7 +15,7 @@ from langchain.memory.chat_message_histories import StreamlitChatMessageHistory
 import streamlit as st
 import spacy
 import json
-import pypdf2
+import PyPDF2 as pypdf2
 
 # Configure API keys and environment
 openai.api_key = "YOUR_OPENAI_API_KEY"
@@ -25,6 +26,21 @@ index_name = "esg-rag-index"  # Index name for Pinecone
 source_type = "json"  # Source type for regulations (e.g., JSON, database)
 
 # Helper functions
+def load_regulations_from_source(source_type, config):
+    if source_type == "json":
+        with open(config["json_file"], "r") as file:
+            return json.load(file)
+    elif source_type == "database":
+        db_connection = mysql.connector.connect(**config["db_config"])
+        cursor = db_connection.cursor()
+        cursor.execute("SELECT id, regulation_text FROM esg_regulations")  # Include ID
+        regulations = [(row[0], row[1]) for row in cursor.fetchall()]  # Store as (id, text)
+        cursor.close()
+        db_connection.close()
+        return regulations
+    else:
+        raise ValueError("Unsupported source type")
+
 def load_policy_from_pdf(pdf_file):
     with open(pdf_file, "rb") as file:
         reader = pypdf2.PdfReader(file)
@@ -33,15 +49,27 @@ def load_policy_from_pdf(pdf_file):
             policy_text += page.extract_text()
     return policy_text
 
-def clean_policy_text(text):
-    # Placeholder for text cleaning logic
-    return text
+def clean_policy_text(text, pipeline=["basic_cleaning", "spacy_lemmatization"]):
+    # Basic cleaning
+    def basic_cleaning(text):
+        text = text.lower()  # Normalize case
+        text = text.replace("\n", " ")  # Replace newlines with spaces
+        return text 
 
-def load_regulations_from_source():
-    if source_type == "json":
-        with open("regulations.json") as file:
-            return json.load(file)
-    # Add loaders for other source types if needed
+    # Spacy-based cleaning
+    def spacy_lemmatization(text):
+        nlp = spacy.load("en_core_web_sm")  
+        return " ".join([token.lemma_ for token in nlp(text)])
+
+    # Apply functions dynamically
+    for step in pipeline:
+        if step == "basic_cleaning":
+            text = basic_cleaning(text)
+        elif step == "spacy_lemmatization":
+            text = spacy_lemmatization(text)
+        # ... add more steps
+
+    return text
 
 def extract_policy(source_documents):
     # Placeholder for policy extraction logic
