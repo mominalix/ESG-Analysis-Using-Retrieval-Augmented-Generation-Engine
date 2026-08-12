@@ -1,137 +1,49 @@
-version: '3.8'
+name: esg-analysis
 
 services:
-  # Main ESG Analysis API
-  esg-analysis-api:
+  api:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     environment:
-      - DEBUG=true
-      - DATABASE_URL=postgresql://postgres:password@postgres:5432/esg_analysis
-      - VECTOR_DB_PROVIDER=qdrant
-      - QDRANT_URL=http://qdrant:6333
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      VECTOR_STORE_TYPE: ${VECTOR_STORE_TYPE:-memory}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8501}
     env_file:
-      - .env
+      - path: .env
+        required: false
     volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-    depends_on:
-      - postgres
-      - redis
-      - qdrant
-    networks:
-      - esg-network
+      - app_data:/app/data
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
-  # PostgreSQL Database
-  postgres:
-    image: postgres:15-alpine
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "${UI_PORT:-8501}:8501"
     environment:
-      POSTGRES_DB: esg_analysis
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
-    ports:
-      - "5432:5432"
-    networks:
-      - esg-network
+      ESG_API_URL: http://api:8000
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+    depends_on:
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
-  # Redis for caching
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - esg-network
-    restart: unless-stopped
-    command: redis-server --appendonly yes
-
-  # Qdrant Vector Database (alternative to Chroma)
   qdrant:
-    image: qdrant/qdrant:v1.8.0
+    image: qdrant/qdrant:v1.18.3
+    profiles: ["qdrant"]
     ports:
       - "6333:6333"
       - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
-    environment:
-      - QDRANT__SERVICE__HTTP_PORT=6333
-      - QDRANT__SERVICE__GRPC_PORT=6334
-    networks:
-      - esg-network
-    restart: unless-stopped
-
-  # Prometheus for monitoring
-  prometheus:
-    image: prom/prometheus:latest
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--web.enable-lifecycle'
-    networks:
-      - esg-network
-    restart: unless-stopped
-
-  # Grafana for dashboards
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
-    networks:
-      - esg-network
-    restart: unless-stopped
-
-  # Streamlit UI (optional)
-  streamlit-ui:
-    build:
-      context: .
-      dockerfile: Dockerfile.streamlit
-    ports:
-      - "8501:8501"
-    environment:
-      - ESG_API_URL=http://esg-analysis-api:8000
-      - ADMIN_TOKEN=admin-token-change-this
-    env_file:
-      - .env
-    depends_on:
-      - esg-analysis-api
-    networks:
-      - esg-network
     restart: unless-stopped
 
 volumes:
-  postgres_data:
-  redis_data:
+  app_data:
   qdrant_data:
-  prometheus_data:
-  grafana_data:
-
-networks:
-  esg-network:
-    driver: bridge

@@ -1,19 +1,33 @@
+# Secrets and local configuration
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-.env.development
-.env.test
-.env.production
-.env.development.local
-.env.test.local
-.env.production.local
+.env.*
+!.env.example
+*.pem
+*.key
 
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Runtime data
+data/
+logs/
+uploads/
+chroma_db/
+*.log
+
+# Editors and operating systems
 .vscode/
 .idea/
-venv/
-.venv/
 .DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+{
+  "frameworks": [
+    {"id": "CSRD", "label": "CSRD", "region": "European Union", "type": "Mandatory reporting"},
+    {"id": "GRI", "label": "GRI Standards", "region": "Global", "type": "Impact reporting"},
+    {"id": "SASB", "label": "SASB Standards", "region": "Global", "type": "Industry standards"},
+    {"id": "TCFD", "label": "TCFD", "region": "Global", "type": "Climate disclosure"},
+    {"id": "EU_Taxonomy", "label": "EU Taxonomy", "region": "European Union", "type": "Classification system"},
+    {"id": "SEC_Climate", "label": "SEC Climate", "region": "United States", "type": "Climate disclosure"}
+  ],
+  "categories": {
+    "Environmental": ["carbon", "emission", "climate", "energy", "waste", "water", "renewable", "biodiversity", "pollution", "greenhouse"],
+    "Social": ["employee", "diversity", "inclusion", "safety", "community", "human rights", "labor", "workforce", "training", "consumer"],
+    "Governance": ["governance", "board", "ethics", "compliance", "risk", "audit", "transparency", "management", "executive", "policy"]
+  },
+  "document_types": ["policy", "report", "regulation", "standard", "guidance"]
+}

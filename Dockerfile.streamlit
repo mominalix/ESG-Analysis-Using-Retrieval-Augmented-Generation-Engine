@@ -1,39 +1,25 @@
-# Streamlit UI for ESG Analysis Platform
-FROM python:3.11-slim
+FROM python:3.13-slim
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set working directory
 WORKDIR /app
 
-# Install Python dependencies for Streamlit
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN adduser --disabled-password --gecos "" --uid 10001 appuser
 
-# Copy Streamlit app
-COPY ui/ ./ui/
-COPY src/core/config.py ./src/core/
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY ui ./ui
+COPY config ./config
+RUN pip install ".[ui]"
 
-# Create non-root user
-RUN adduser --disabled-password --gecos '' appuser && \
-    chown -R appuser:appuser /app
-
+RUN chown -R appuser:appuser /app
 USER appuser
 
-# Expose Streamlit port
 EXPOSE 8501
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"]
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8501/healthz || exit 1
-
-# Run Streamlit
 CMD ["streamlit", "run", "ui/main.py", "--server.port=8501", "--server.address=0.0.0.0"]

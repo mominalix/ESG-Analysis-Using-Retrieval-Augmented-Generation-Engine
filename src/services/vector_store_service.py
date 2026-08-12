@@ -1,379 +1,456 @@
-"""
-Vector Store Service for managing document embeddings and similarity search
-"""
-from typing import List, Dict, Any, Optional, Tuple
-from abc import ABC, abstractmethod
+"""Pluggable vector/document stores with a dependency-free local provider."""
+
+from __future__ import annotations
+
 import asyncio
+import math
+import re
+from abc import ABC, abstractmethod
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
-from langchain_chroma import Chroma
-from langchain_community.vectorstores import Pinecone, Qdrant
-from qdrant_client import QdrantClient
-from qdrant_client.models import VectorParams, Distance
-import pinecone
-import chromadb
 from langsmith import traceable
 
-from ..core.config import settings
+from ..core.config import reveal, settings
+from ..core.exceptions import ConfigurationError, VectorStoreError
 from ..core.logging import LoggingMixin
-from ..core.exceptions import VectorStoreError, ConfigurationError
 
 
-@dataclass
+@dataclass(slots=True)
 class SearchResult:
-    """Document search result with metadata"""
     document: Document
     score: float
     rank: int
 
 
+def _matches(metadata: dict[str, Any], filters: dict[str, Any] | None) -> bool:
+    if not filters:
+        return True
+    return all(
+        metadata.get(key) == getattr(value, "value", value) for key, value in filters.items()
+    )
+
+
 class BaseVectorStore(ABC, LoggingMixin):
-    """Abstract base class for vector stores"""
-    
     @abstractmethod
-    async def add_documents(self, documents: List[Document]) -> List[str]:
-        """Add documents to vector store"""
-        pass
-    
+    async def add_documents(self, documents: list[Document]) -> list[str]:
+        raise NotImplementedError
+
     @abstractmethod
     async def similarity_search(
-        self, 
-        query: str, 
-        k: int = 5,
-        filter_dict: Optional[Dict[str, Any]] = None
-    ) -> List[SearchResult]:
-        """Perform similarity search"""
-        pass
-    
-    @abstractmethod
+        self, query: str, k: int = 5, filter_dict: dict[str, Any] | None = None
+    ) -> list[SearchResult]:
+        raise NotImplementedError
+
     async def hybrid_search(
-        self, 
-        query: str, 
+        self,
+        query: str,
         k: int = 5,
         alpha: float = 0.5,
-        filter_dict: Optional[Dict[str, Any]] = None
-    ) -> List[SearchResult]:
-        """Perform hybrid (semantic + keyword) search"""
-        pass
-    
+        filter_dict: dict[str, Any] | None = None,
+    ) -> list[SearchResult]:
+        # Providers can override this when native sparse+dense search is enabled.
+        return await self.similarity_search(query, k, filter_dict)
+
     @abstractmethod
-    async def delete_documents(self, document_ids: List[str]) -> bool:
-        """Delete documents from vector store"""
-        pass
+    async def all_documents(self, filter_dict: dict[str, Any] | None = None) -> list[Document]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_chunks(self, chunk_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    async def health(self) -> str:
+        return "healthy"
+
+
+class MemoryVectorStore(BaseVectorStore):
+    """Process-local lexical store for development, tests, and small datasets."""
+
+    _token_pattern = re.compile(r"[\w-]+", re.UNICODE)
+
+    def __init__(self) -> None:
+        self._documents: dict[str, Document] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _chunk_id(document: Document) -> str:
+        chunk_id = document.metadata.get("chunk_id")
+        if not chunk_id:
+            raise VectorStoreError("Every document chunk must include chunk_id metadata")
+        return str(chunk_id)
+
+    @classmethod
+    def _tokens(cls, text: str) -> Counter[str]:
+        return Counter(cls._token_pattern.findall(text.casefold()))
+
+    @classmethod
+    def _score(cls, query: str, content: str) -> float:
+        query_tokens = cls._tokens(query)
+        document_tokens = cls._tokens(content)
+        if not query_tokens or not document_tokens:
+            return 0.0
+        numerator = sum(count * document_tokens[token] for token, count in query_tokens.items())
+        query_norm = math.sqrt(sum(count * count for count in query_tokens.values()))
+        document_norm = math.sqrt(sum(count * count for count in document_tokens.values()))
+        return numerator / (query_norm * document_norm) if query_norm and document_norm else 0.0
+
+    async def add_documents(self, documents: list[Document]) -> list[str]:
+        ids = [self._chunk_id(document) for document in documents]
+        async with self._lock:
+            self._documents.update(zip(ids, documents, strict=True))
+        return ids
+
+    async def similarity_search(
+        self, query: str, k: int = 5, filter_dict: dict[str, Any] | None = None
+    ) -> list[SearchResult]:
+        documents = await self.all_documents(filter_dict)
+        scored = sorted(
+            ((document, self._score(query, document.page_content)) for document in documents),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:k]
+        return [
+            SearchResult(document=document, score=score, rank=index)
+            for index, (document, score) in enumerate(scored, start=1)
+        ]
+
+    async def all_documents(self, filter_dict: dict[str, Any] | None = None) -> list[Document]:
+        async with self._lock:
+            documents = list(self._documents.values())
+        return [document for document in documents if _matches(document.metadata, filter_dict)]
+
+    async def delete_chunks(self, chunk_ids: list[str]) -> None:
+        async with self._lock:
+            for chunk_id in chunk_ids:
+                self._documents.pop(chunk_id, None)
 
 
 class ChromaVectorStore(BaseVectorStore):
-    """ChromaDB vector store implementation"""
-    
-    def __init__(self, collection_name: str = "esg_documents"):
-        self.collection_name = collection_name
-        self.embeddings = OpenAIEmbeddings(
-            model=settings.openai_embedding_model,
-            api_key=settings.openai_api_key
-        )
-        
+    def __init__(self, collection_name: str):
         try:
+            from langchain_chroma import Chroma
+            from langchain_openai import OpenAIEmbeddings
+
+            api_key = reveal(settings.openai_api_key)
+            if not api_key:
+                raise ConfigurationError("OPENAI_API_KEY is required for Chroma embeddings")
+            embeddings = OpenAIEmbeddings(model=settings.openai_embedding_model, api_key=api_key)
             self.vector_store = Chroma(
                 collection_name=collection_name,
-                embedding_function=self.embeddings,
-                persist_directory=settings.chroma_persist_directory,
+                embedding_function=embeddings,
+                persist_directory=str(settings.chroma_persist_directory),
             )
-            self.logger.info("ChromaDB vector store initialized", collection=collection_name)
-        except Exception as e:
-            self.logger.error("Failed to initialize ChromaDB", error=str(e))
-            raise VectorStoreError(f"ChromaDB initialization failed: {str(e)}")
-    
-    @traceable(name="chroma_add_documents")
-    async def add_documents(self, documents: List[Document]) -> List[str]:
-        """Add documents to ChromaDB"""
+        except (ImportError, ConfigurationError):
+            raise
+        except Exception as exc:
+            raise VectorStoreError("Chroma initialization failed") from exc
+
+    async def add_documents(self, documents: list[Document]) -> list[str]:
+        ids = [str(document.metadata["chunk_id"]) for document in documents]
         try:
-            self.logger.info("Adding documents to ChromaDB", count=len(documents))
-            
-            # ChromaDB add_documents is synchronous, so we run it in executor
-            loop = asyncio.get_event_loop()
-            ids = await loop.run_in_executor(
-                None, 
-                self.vector_store.add_documents, 
-                documents
-            )
-            
-            self.logger.info("Documents added successfully", ids_count=len(ids))
-            return ids
-        except Exception as e:
-            self.logger.error("Failed to add documents to ChromaDB", error=str(e))
-            raise VectorStoreError(f"ChromaDB add documents failed: {str(e)}")
-    
+            return await asyncio.to_thread(self.vector_store.add_documents, documents, ids=ids)
+        except Exception as exc:
+            raise VectorStoreError("Chroma document indexing failed") from exc
+
     @traceable(name="chroma_similarity_search")
     async def similarity_search(
-        self, 
-        query: str, 
-        k: int = 5,
-        filter_dict: Optional[Dict[str, Any]] = None
-    ) -> List[SearchResult]:
-        """Perform similarity search with ChromaDB"""
+        self, query: str, k: int = 5, filter_dict: dict[str, Any] | None = None
+    ) -> list[SearchResult]:
         try:
-            self.logger.info("Performing similarity search", query_length=len(query), k=k)
-            
-            loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(
-                None,
-                self.vector_store.similarity_search_with_score,
+            results = await asyncio.to_thread(
+                self.vector_store.similarity_search_with_relevance_scores,
                 query,
-                k,
-                filter_dict
+                k=k,
+                filter=filter_dict,
             )
-            
-            search_results = [
-                SearchResult(
-                    document=doc,
-                    score=score,
-                    rank=idx
-                )
-                for idx, (doc, score) in enumerate(results)
+            return [
+                SearchResult(document=document, score=max(0.0, min(1.0, score)), rank=index)
+                for index, (document, score) in enumerate(results, start=1)
             ]
-            
-            self.logger.info("Similarity search completed", results_count=len(search_results))
-            return search_results
-        except Exception as e:
-            self.logger.error("Similarity search failed", error=str(e))
-            raise VectorStoreError(f"ChromaDB similarity search failed: {str(e)}")
-    
-    async def hybrid_search(
-        self, 
-        query: str, 
-        k: int = 5,
-        alpha: float = 0.5,
-        filter_dict: Optional[Dict[str, Any]] = None
-    ) -> List[SearchResult]:
-        """ChromaDB doesn't natively support hybrid search, fall back to similarity search"""
-        self.logger.warning("ChromaDB doesn't support hybrid search, using similarity search")
-        return await self.similarity_search(query, k, filter_dict)
-    
-    async def delete_documents(self, document_ids: List[str]) -> bool:
-        """Delete documents from ChromaDB"""
+        except Exception as exc:
+            raise VectorStoreError("Chroma search failed") from exc
+
+    async def all_documents(self, filter_dict: dict[str, Any] | None = None) -> list[Document]:
         try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                self.vector_store.delete,
-                document_ids
+            result = await asyncio.to_thread(
+                self.vector_store.get,
+                where=filter_dict,
+                include=["documents", "metadatas"],
             )
-            self.logger.info("Documents deleted", count=len(document_ids))
-            return True
-        except Exception as e:
-            self.logger.error("Failed to delete documents", error=str(e))
-            raise VectorStoreError(f"ChromaDB delete failed: {str(e)}")
+            return [
+                Document(page_content=content or "", metadata=metadata or {})
+                for content, metadata in zip(
+                    result.get("documents", []), result.get("metadatas", []), strict=True
+                )
+            ]
+        except Exception as exc:
+            raise VectorStoreError("Unable to enumerate Chroma documents") from exc
+
+    async def delete_chunks(self, chunk_ids: list[str]) -> None:
+        try:
+            await asyncio.to_thread(self.vector_store.delete, ids=chunk_ids)
+        except Exception as exc:
+            raise VectorStoreError("Chroma document deletion failed") from exc
 
 
 class QdrantVectorStore(BaseVectorStore):
-    """Qdrant vector store implementation with hybrid search support"""
-    
-    def __init__(self, collection_name: str = "esg_documents"):
-        self.collection_name = collection_name
-        self.embeddings = OpenAIEmbeddings(
-            model=settings.openai_embedding_model,
-            api_key=settings.openai_api_key
-        )
-        
+    def __init__(self, collection_name: str):
         try:
+            from langchain_openai import OpenAIEmbeddings
+            from langchain_qdrant import QdrantVectorStore as LangChainQdrant
             from qdrant_client import QdrantClient
-            
+            from qdrant_client.models import Distance, VectorParams
+
+            api_key = reveal(settings.openai_api_key)
+            if not api_key:
+                raise ConfigurationError("OPENAI_API_KEY is required for Qdrant embeddings")
+
+            self.collection_name = collection_name
             self.client = QdrantClient(
-                url=settings.qdrant_url,
-                api_key=settings.qdrant_api_key
+                url=settings.qdrant_url, api_key=reveal(settings.qdrant_api_key)
             )
-            
-            # Initialize collection if it doesn't exist
-            self._initialize_collection()
-            
-            self.vector_store = Qdrant(
-                client=self.client,
-                collection_name=collection_name,
-                embeddings=self.embeddings,
-            )
-            
-            self.logger.info("Qdrant vector store initialized", collection=collection_name)
-        except Exception as e:
-            self.logger.error("Failed to initialize Qdrant", error=str(e))
-            raise VectorStoreError(f"Qdrant initialization failed: {str(e)}")
-    
-    def _initialize_collection(self):
-        """Initialize Qdrant collection with proper configuration"""
-        try:
-            collections = self.client.get_collections().collections
-            collection_names = [c.name for c in collections]
-            
-            if self.collection_name not in collection_names:
+            if not self.client.collection_exists(collection_name):
                 self.client.create_collection(
-                    collection_name=self.collection_name,
+                    collection_name=collection_name,
                     vectors_config=VectorParams(
                         size=settings.embedding_dimension,
-                        distance=Distance.COSINE
-                    )
+                        distance=Distance.COSINE,
+                    ),
                 )
-                self.logger.info("Created new Qdrant collection", collection=self.collection_name)
-        except Exception as e:
-            self.logger.error("Failed to initialize Qdrant collection", error=str(e))
-            raise VectorStoreError(f"Qdrant collection initialization failed: {str(e)}")
-    
-    @traceable(name="qdrant_add_documents")
-    async def add_documents(self, documents: List[Document]) -> List[str]:
-        """Add documents to Qdrant"""
-        try:
-            self.logger.info("Adding documents to Qdrant", count=len(documents))
-            
-            loop = asyncio.get_event_loop()
-            ids = await loop.run_in_executor(
-                None,
-                self.vector_store.add_documents,
-                documents
+            self.vector_store = LangChainQdrant(
+                client=self.client,
+                collection_name=collection_name,
+                embedding=OpenAIEmbeddings(
+                    model=settings.openai_embedding_model,
+                    api_key=api_key,
+                ),
             )
-            
-            self.logger.info("Documents added successfully", ids_count=len(ids))
-            return ids
-        except Exception as e:
-            self.logger.error("Failed to add documents to Qdrant", error=str(e))
-            raise VectorStoreError(f"Qdrant add documents failed: {str(e)}")
-    
+        except (ImportError, ConfigurationError):
+            raise
+        except Exception as exc:
+            raise VectorStoreError("Qdrant initialization failed") from exc
+
+    async def add_documents(self, documents: list[Document]) -> list[str]:
+        ids = [str(document.metadata["chunk_id"]) for document in documents]
+        try:
+            return await asyncio.to_thread(self.vector_store.add_documents, documents, ids=ids)
+        except Exception as exc:
+            raise VectorStoreError("Qdrant document indexing failed") from exc
+
     @traceable(name="qdrant_similarity_search")
     async def similarity_search(
-        self, 
-        query: str, 
-        k: int = 5,
-        filter_dict: Optional[Dict[str, Any]] = None
-    ) -> List[SearchResult]:
-        """Perform similarity search with Qdrant"""
+        self, query: str, k: int = 5, filter_dict: dict[str, Any] | None = None
+    ) -> list[SearchResult]:
         try:
-            self.logger.info("Performing similarity search", query_length=len(query), k=k)
-            
-            loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(
-                None,
-                self.vector_store.similarity_search_with_score,
+            qdrant_filter = self._filter(filter_dict)
+            results = await asyncio.to_thread(
+                self.vector_store.similarity_search_with_relevance_scores,
                 query,
-                k,
-                filter_dict
+                k=k,
+                filter=qdrant_filter,
             )
-            
-            search_results = [
-                SearchResult(
-                    document=doc,
-                    score=score,
-                    rank=idx
-                )
-                for idx, (doc, score) in enumerate(results)
+            return [
+                SearchResult(document=document, score=max(0.0, min(1.0, score)), rank=index)
+                for index, (document, score) in enumerate(results, start=1)
             ]
-            
-            self.logger.info("Similarity search completed", results_count=len(search_results))
-            return search_results
-        except Exception as e:
-            self.logger.error("Similarity search failed", error=str(e))
-            raise VectorStoreError(f"Qdrant similarity search failed: {str(e)}")
-    
-    async def hybrid_search(
-        self, 
-        query: str, 
-        k: int = 5,
-        alpha: float = 0.5,
-        filter_dict: Optional[Dict[str, Any]] = None
-    ) -> List[SearchResult]:
-        """Perform hybrid search with Qdrant"""
+        except Exception as exc:
+            raise VectorStoreError("Qdrant search failed") from exc
+
+    @staticmethod
+    def _filter(filter_dict: dict[str, Any] | None):
+        if not filter_dict:
+            return None
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        return Filter(
+            must=[
+                FieldCondition(
+                    key=f"metadata.{key}",
+                    match=MatchValue(value=getattr(value, "value", value)),
+                )
+                for key, value in filter_dict.items()
+            ]
+        )
+
+    async def all_documents(self, filter_dict: dict[str, Any] | None = None) -> list[Document]:
+        def scroll_all() -> list[Document]:
+            records: list[Document] = []
+            offset = None
+            while True:
+                points, offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=self._filter(filter_dict),
+                    limit=256,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in points:
+                    payload = point.payload or {}
+                    records.append(
+                        Document(
+                            page_content=str(payload.get("page_content", "")),
+                            metadata=dict(payload.get("metadata", {})),
+                        )
+                    )
+                if offset is None:
+                    break
+            return records
+
         try:
-            self.logger.info("Performing hybrid search", query_length=len(query), k=k, alpha=alpha)
-            
-            # For now, fall back to similarity search
-            # TODO: Implement true hybrid search with BM25 + semantic
-            return await self.similarity_search(query, k, filter_dict)
-        except Exception as e:
-            self.logger.error("Hybrid search failed", error=str(e))
-            raise VectorStoreError(f"Qdrant hybrid search failed: {str(e)}")
-    
-    async def delete_documents(self, document_ids: List[str]) -> bool:
-        """Delete documents from Qdrant"""
+            return await asyncio.to_thread(scroll_all)
+        except Exception as exc:
+            raise VectorStoreError("Unable to enumerate Qdrant documents") from exc
+
+    async def delete_chunks(self, chunk_ids: list[str]) -> None:
         try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                self.vector_store.delete,
-                document_ids
-            )
-            self.logger.info("Documents deleted", count=len(document_ids))
-            return True
-        except Exception as e:
-            self.logger.error("Failed to delete documents", error=str(e))
-            raise VectorStoreError(f"Qdrant delete failed: {str(e)}")
+            await asyncio.to_thread(self.vector_store.delete, ids=chunk_ids)
+        except Exception as exc:
+            raise VectorStoreError("Qdrant document deletion failed") from exc
+
+    async def health(self) -> str:
+        try:
+            await asyncio.to_thread(self.client.get_collections)
+            return "healthy"
+        except Exception:
+            return "unhealthy"
+
+
+StoreFactory = Callable[[], BaseVectorStore]
 
 
 class VectorStoreService(LoggingMixin):
-    """Main vector store service that manages different providers"""
-    
-    def __init__(self):
-        self.stores: Dict[str, BaseVectorStore] = {}
-        self._initialize_stores()
-    
-    def _initialize_stores(self) -> None:
-        """Initialize available vector stores"""
+    """Lazy provider registry plus provider-independent document operations."""
+
+    def __init__(self) -> None:
+        self._stores: dict[str, BaseVectorStore] = {}
+        self._factories: dict[str, StoreFactory] = {
+            "memory": MemoryVectorStore,
+            "chroma": lambda: ChromaVectorStore(settings.chroma_collection_name),
+            "qdrant": lambda: QdrantVectorStore(settings.qdrant_collection_name),
+        }
+
+    def register_store(self, name: str, factory: StoreFactory) -> None:
+        self._factories[name.lower()] = factory
+
+    def get_store(self, store_name: str | None = None) -> BaseVectorStore:
+        name = (store_name or settings.vector_store_type).lower()
+        if name not in self._factories:
+            raise ConfigurationError(f"Unknown vector store provider: {name}")
+        if name not in self._stores:
+            self._stores[name] = self._factories[name]()
+        return self._stores[name]
+
+    async def health(self) -> str:
         try:
-            if settings.vector_store_type.lower() == "chroma":
-                self.stores["chroma"] = ChromaVectorStore(settings.chroma_collection_name)
-                self.logger.info("ChromaDB store initialized")
-            elif settings.vector_store_type.lower() == "qdrant":
-                self.stores["qdrant"] = QdrantVectorStore(settings.qdrant_collection_name)
-                self.logger.info("Qdrant store initialized")
-            else:
-                # Default to ChromaDB
-                self.stores["chroma"] = ChromaVectorStore(settings.chroma_collection_name)
-                self.logger.info("Default ChromaDB store initialized")
-        except Exception as e:
-            self.logger.error("Failed to initialize vector stores", error=str(e))
-            raise VectorStoreError(f"Vector store initialization failed: {str(e)}")
-    
-    def get_store(self, store_name: Optional[str] = None) -> BaseVectorStore:
-        """Get vector store by name"""
-        store_name = store_name or settings.vector_store_type.lower()
-        
-        if store_name not in self.stores:
-            raise VectorStoreError(f"Vector store '{store_name}' not available")
-        
-        return self.stores[store_name]
-    
+            return await self.get_store().health()
+        except Exception as exc:
+            self.logger.warning("Vector store health check failed", error=str(exc))
+            return "unhealthy"
+
     async def add_documents(
-        self, 
-        documents: List[Document], 
-        store_name: Optional[str] = None
-    ) -> List[str]:
-        """Add documents to vector store"""
-        store = self.get_store(store_name)
-        return await store.add_documents(documents)
-    
+        self, documents: list[Document], store_name: str | None = None
+    ) -> list[str]:
+        if not documents:
+            raise VectorStoreError("No document chunks were supplied for indexing")
+        return await self.get_store(store_name).add_documents(documents)
+
     async def search(
         self,
         query: str,
         k: int = 5,
         search_type: str = "similarity",
         alpha: float = 0.5,
-        filter_dict: Optional[Dict[str, Any]] = None,
-        store_name: Optional[str] = None
-    ) -> List[SearchResult]:
-        """Search documents in vector store"""
+        filter_dict: dict[str, Any] | None = None,
+        store_name: str | None = None,
+    ) -> list[SearchResult]:
         store = self.get_store(store_name)
-        
         if search_type == "hybrid":
             return await store.hybrid_search(query, k, alpha, filter_dict)
-        else:
-            return await store.similarity_search(query, k, filter_dict)
-    
-    async def delete_documents(
-        self, 
-        document_ids: List[str], 
-        store_name: Optional[str] = None
-    ) -> bool:
-        """Delete documents from vector store"""
+        return await store.similarity_search(query, k, filter_dict)
+
+    async def list_documents(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        filter_dict: dict[str, Any] | None = None,
+        store_name: str | None = None,
+    ) -> tuple[list[Document], int]:
+        chunks = await self.get_store(store_name).all_documents(filter_dict)
+        unique: dict[str, Document] = {}
+        for chunk in chunks:
+            document_hash = str(chunk.metadata.get("document_hash", ""))
+            if document_hash and document_hash not in unique:
+                unique[document_hash] = chunk
+        documents = sorted(
+            unique.values(),
+            key=lambda item: str(item.metadata.get("processed_at", "")),
+            reverse=True,
+        )
+        return documents[offset : offset + limit], len(documents)
+
+    async def get_document(
+        self, document_hash: str, store_name: str | None = None
+    ) -> list[Document]:
+        chunks = await self.get_store(store_name).all_documents({"document_hash": document_hash})
+        return sorted(chunks, key=lambda chunk: int(chunk.metadata.get("chunk_index", 0)))
+
+    async def delete_document(self, document_hash: str, store_name: str | None = None) -> bool:
         store = self.get_store(store_name)
-        return await store.delete_documents(document_ids)
+        chunks = await store.all_documents({"document_hash": document_hash})
+        chunk_ids = [
+            str(chunk.metadata["chunk_id"]) for chunk in chunks if chunk.metadata.get("chunk_id")
+        ]
+        if not chunk_ids:
+            return False
+        await store.delete_chunks(chunk_ids)
+        return True
+
+    async def stats(self, store_name: str | None = None) -> dict[str, Any]:
+        chunks = await self.get_store(store_name).all_documents()
+        documents: dict[str, dict[str, Any]] = {}
+        total_content_length = 0
+        for chunk in chunks:
+            metadata = chunk.metadata
+            document_hash = str(metadata.get("document_hash", ""))
+            if not document_hash:
+                continue
+            total_content_length += len(chunk.page_content)
+            record = documents.setdefault(
+                document_hash,
+                {
+                    "document_hash": document_hash,
+                    "filename": metadata.get("filename", "unknown"),
+                    "framework": metadata.get("esg_framework"),
+                    "category": metadata.get("esg_category"),
+                    "doc_type": metadata.get("document_type"),
+                    "chunks": 0,
+                },
+            )
+            record["chunks"] += 1
+
+        def counts(key: str) -> dict[str, int]:
+            output: dict[str, int] = {}
+            for document in documents.values():
+                value = document.get(key)
+                if value:
+                    output[str(value)] = output.get(str(value), 0) + 1
+            return output
+
+        return {
+            "total_documents": len(documents),
+            "documents_by_framework": counts("framework"),
+            "documents_by_category": counts("category"),
+            "documents_by_type": counts("doc_type"),
+            "total_chunks": len(chunks),
+            "average_chunk_size": round(total_content_length / len(chunks)) if chunks else 0,
+            "documents": list(documents.values()),
+        }
 
 
-# Global vector store service instance
 vector_store_service = VectorStoreService()

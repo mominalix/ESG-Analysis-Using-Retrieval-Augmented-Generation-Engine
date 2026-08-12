@@ -1,123 +1,121 @@
-"""
-Analytics and monitoring API routes
-"""
-from datetime import datetime, timedelta
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Query
+"""Analytics derived from actual query events and indexed documents."""
 
-from ...core.logging import get_logger
-from ..models import AnalyticsResponse, UsageStats, FrameworkStats
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import UTC, datetime, timedelta
+
+from fastapi import APIRouter, Query
+
+from ...core.taxonomy import get_taxonomy
+from ...services.analytics_service import analytics_service
+from ...services.vector_store_service import vector_store_service
+from ..models import AnalyticsResponse, FrameworkStats, UsageStats
+
 
 router = APIRouter()
-logger = get_logger("analytics_api")
+
+
+def _period(
+    start_date: datetime | None,
+    end_date: datetime | None,
+) -> tuple[datetime, datetime]:
+    end = end_date or datetime.now(UTC)
+    start = start_date or end - timedelta(days=30)
+    if start > end:
+        raise ValueError("start_date must be before end_date")
+    return start, end
 
 
 @router.get("/usage", response_model=AnalyticsResponse)
 async def get_usage_analytics(
-    start_date: Optional[datetime] = Query(None, description="Start date for analytics period"),
-    end_date: Optional[datetime] = Query(None, description="End date for analytics period"),
-    framework: Optional[str] = Query(None, description="Filter by ESG framework")
-):
-    """Get usage analytics and statistics"""
-    try:
-        # Set default date range if not provided
-        if not end_date:
-            end_date = datetime.now()
-        if not start_date:
-            start_date = end_date - timedelta(days=30)
-        
-        logger.info("Analytics request", start_date=start_date, end_date=end_date, framework=framework)
-        
-        # In a real implementation, this would query a database or analytics service
-        # For now, return placeholder data
-        
-        usage_stats = UsageStats(
-            total_queries=0,
-            total_documents=0,
-            average_response_time_ms=0.0,
-            most_used_framework="CSRD",
-            most_queried_category="Environmental"
-        )
-        
-        framework_stats = [
+    start_date: datetime | None = Query(default=None),
+    end_date: datetime | None = Query(default=None),
+    framework: str | None = Query(default=None),
+) -> AnalyticsResponse:
+    start, end = _period(start_date, end_date)
+    events = analytics_service.events_between(start, end)
+    if framework:
+        events = [event for event in events if event.framework == framework]
+
+    stats = await vector_store_service.stats()
+    framework_events: dict[str, list] = defaultdict(list)
+    for event in events:
+        if event.framework:
+            framework_events[event.framework].append(event)
+
+    framework_ids = [framework] if framework else get_taxonomy().framework_ids
+    framework_stats = []
+    for framework_id in framework_ids:
+        matching = framework_events.get(framework_id, [])
+        framework_stats.append(
             FrameworkStats(
-                framework="CSRD",
-                query_count=0,
-                document_count=0,
-                average_confidence=0.0
-            ),
-            FrameworkStats(
-                framework="GRI",
-                query_count=0,
-                document_count=0,
-                average_confidence=0.0
-            ),
-            FrameworkStats(
-                framework="TCFD",
-                query_count=0,
-                document_count=0,
-                average_confidence=0.0
+                framework=framework_id,
+                query_count=len(matching),
+                document_count=stats["documents_by_framework"].get(framework_id, 0),
+                average_confidence=(
+                    sum(event.confidence for event in matching) / len(matching) if matching else 0.0
+                ),
             )
-        ]
-        
-        if framework:
-            framework_stats = [fs for fs in framework_stats if fs.framework == framework]
-        
-        return AnalyticsResponse(
-            usage_stats=usage_stats,
-            framework_stats=framework_stats,
-            period_start=start_date,
-            period_end=end_date
         )
-        
-    except Exception as e:
-        logger.error("Analytics query failed", error=str(e))
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "Analytics query failed", "detail": str(e)}
-        )
+
+    return AnalyticsResponse(
+        usage_stats=UsageStats(
+            total_queries=len(events),
+            total_documents=stats["total_documents"],
+            average_response_time_ms=(
+                sum(event.duration_ms for event in events) / len(events) if events else 0.0
+            ),
+            most_used_framework=analytics_service.most_common_framework(events),
+            most_queried_category=analytics_service.most_common_category(events),
+        ),
+        framework_stats=framework_stats,
+        period_start=start,
+        period_end=end,
+    )
 
 
 @router.get("/metrics")
-async def get_system_metrics():
-    """Get system performance metrics"""
-    # In a real implementation, this would return actual system metrics
+async def get_system_metrics() -> dict:
+    now = datetime.now(UTC)
+    events = analytics_service.events_between(analytics_service.started_at, now)
     return {
-        "uptime_seconds": 0,
-        "cpu_usage_percent": 0.0,
-        "memory_usage_mb": 0.0,
-        "vector_store_size_mb": 0.0,
-        "active_connections": 0,
-        "cache_hit_rate": 0.0,
-        "average_query_latency_ms": 0.0
+        "uptime_seconds": max(0, int((now - analytics_service.started_at).total_seconds())),
+        "queries_since_start": len(events),
+        "average_query_latency_ms": (
+            sum(event.duration_ms for event in events) / len(events) if events else 0.0
+        ),
+        "indexed_documents": (await vector_store_service.stats())["total_documents"],
     }
 
 
 @router.get("/top-queries")
-async def get_top_queries(limit: int = Query(10, ge=1, le=100)):
-    """Get most frequently asked questions"""
-    # In a real implementation, this would query logs or analytics database
+async def get_top_queries(limit: int = Query(default=10, ge=1, le=100)) -> dict:
+    end = datetime.now(UTC)
+    start = end - timedelta(days=30)
+    events = analytics_service.events_between(start, end)
     return {
-        "top_queries": [],
-        "period": "last_30_days",
-        "total_unique_queries": 0
+        "top_queries": analytics_service.top_queries(events, limit),
+        "period_start": start,
+        "period_end": end,
+        "total_unique_queries": len({event.question for event in events}),
     }
 
 
 @router.get("/framework-adoption")
-async def get_framework_adoption():
-    """Get ESG framework adoption statistics"""
+async def get_framework_adoption() -> dict:
+    stats = await vector_store_service.stats()
+    events = analytics_service.events_between(analytics_service.started_at, datetime.now(UTC))
+    query_counts = defaultdict(int)
+    for event in events:
+        if event.framework:
+            query_counts[event.framework] += 1
     return {
         "framework_usage": {
-            "CSRD": {"queries": 0, "documents": 0},
-            "GRI": {"queries": 0, "documents": 0},
-            "SASB": {"queries": 0, "documents": 0},
-            "TCFD": {"queries": 0, "documents": 0},
-            "EU_Taxonomy": {"queries": 0, "documents": 0},
-            "SEC_Climate": {"queries": 0, "documents": 0}
-        },
-        "trends": {
-            "growing_frameworks": [],
-            "declining_frameworks": []
+            framework: {
+                "queries": query_counts[framework],
+                "documents": stats["documents_by_framework"].get(framework, 0),
+            }
+            for framework in get_taxonomy().framework_ids
         }
     }

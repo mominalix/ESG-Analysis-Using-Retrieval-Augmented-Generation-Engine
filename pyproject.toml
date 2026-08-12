@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=82"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esg-analysis-rag"
+version = "3.0.0"
+description = "Evidence-grounded ESG document analysis with a modular RAG backend and Streamlit UI"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+authors = [{name = "ESG Analysis RAG contributors"}]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: FastAPI",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "fastapi>=0.141.1,<1",
+  "uvicorn[standard]>=0.52.1,<1",
+  "pydantic>=2.13.4,<3",
+  "pydantic-settings>=2.15.0,<3",
+  "python-multipart>=0.0.32,<1",
+  "structlog>=26.1.0,<27",
+  "langchain-core>=1.5.4,<2",
+  "langchain-text-splitters>=1.1.2,<2",
+  "langsmith>=0.10.18,<1",
+  "pypdf>=6.15.0,<7",
+  "python-docx>=1.2.0,<2",
+  "openpyxl>=3.1.5,<4",
+]
+
+[project.optional-dependencies]
+openai = ["langchain-openai>=1.4.3,<2"]
+anthropic = ["langchain-anthropic>=1.5.5,<2"]
+chroma = [
+  "langchain-chroma>=1.1.0,<2",
+  "chromadb>=1.5.9,<2",
+  "langchain-openai>=1.4.3,<2",
+]
+qdrant = [
+  "langchain-qdrant>=1.1.0,<2",
+  "qdrant-client>=1.19.0,<2",
+  "langchain-openai>=1.4.3,<2",
+]
+ui = [
+  "streamlit>=1.61.1,<2",
+  "requests>=2.34.2,<3",
+  "pandas>=3.0.5,<4",
+  "plotly>=6.9.0,<7",
+  "reportlab>=5.0.0,<6",
+]
+dev = [
+  "httpx>=0.28.1,<1",
+  "pytest>=9.1.1,<10",
+  "pytest-asyncio>=1.4.0,<2",
+  "ruff>=0.16.2,<1",
+  "pre-commit>=4.6.2,<5",
+]
+
+[tool.setuptools.packages.find]
+include = ["src*", "ui*"]
+
+[tool.setuptools.package-data]
+"src.core" = ["esg_taxonomy.json"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = ["data", "logs", "sample_data"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = ["B008"]
+
+[tool.ruff.format]
+quote-style = "double"

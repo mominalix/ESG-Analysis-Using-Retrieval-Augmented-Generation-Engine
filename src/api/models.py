@@ -1,194 +1,166 @@
-"""
-Pydantic models for API requests and responses
-"""
-from typing import List, Optional, Dict, Any, Union
-from datetime import datetime
+"""Validated public API contracts."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
 from enum import Enum
+from typing import Any
 
-from pydantic import BaseModel, Field, ConfigDict
-
-
-class ESGFramework(str, Enum):
-    """Supported ESG frameworks"""
-    CSRD = "CSRD"
-    GRI = "GRI"
-    SASB = "SASB"
-    TCFD = "TCFD"
-    EU_TAXONOMY = "EU_Taxonomy"
-    SEC_CLIMATE = "SEC_Climate"
-
-
-class ESGCategory(str, Enum):
-    """ESG categories"""
-    ENVIRONMENTAL = "Environmental"
-    SOCIAL = "Social"
-    GOVERNANCE = "Governance"
-
-
-class DocumentType(str, Enum):
-    """Document types"""
-    POLICY = "policy"
-    REPORT = "report"
-    REGULATION = "regulation"
-    STANDARD = "standard"
-    GUIDANCE = "guidance"
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class SearchStrategy(str, Enum):
-    """Search strategies"""
     SIMILARITY = "similarity"
     HYBRID = "hybrid"
 
 
-# Request Models
-class DocumentUploadRequest(BaseModel):
-    """Request model for document upload"""
-    esg_framework: Optional[ESGFramework] = None
-    document_type: Optional[DocumentType] = None
-    company_id: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+def _optional_identifier(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("Value cannot be blank")
+    return normalized
 
 
 class RAGQueryRequest(BaseModel):
-    """Request model for RAG queries"""
-    question: str = Field(..., min_length=1, max_length=2000, description="The question to ask")
-    esg_framework: Optional[ESGFramework] = Field(None, description="Specific ESG framework to focus on")
-    search_strategy: SearchStrategy = Field(SearchStrategy.HYBRID, description="Search strategy to use")
-    k: int = Field(5, ge=1, le=20, description="Number of documents to retrieve")
-    use_query_decomposition: bool = Field(False, description="Whether to use query decomposition for complex questions")
-    stream: bool = Field(False, description="Whether to stream the response")
-    
+    question: str = Field(min_length=2, max_length=4000)
+    esg_framework: str | None = Field(default=None, max_length=80)
+    search_strategy: SearchStrategy = SearchStrategy.HYBRID
+    k: int = Field(default=5, ge=1, le=50)
+    use_query_decomposition: bool = False
+    stream: bool = False
+
     model_config = ConfigDict(
+        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
-                "question": "What are the key requirements for carbon emission reporting under CSRD?",
+                "question": "What evidence supports the climate disclosures in these documents?",
                 "esg_framework": "CSRD",
                 "search_strategy": "hybrid",
                 "k": 5,
-                "use_query_decomposition": False,
-                "stream": False
             }
-        }
+        },
     )
+
+    _normalize_framework = field_validator("esg_framework")(_optional_identifier)
 
 
 class DocumentSearchRequest(BaseModel):
-    """Request model for document search"""
-    query: str = Field(..., min_length=1, max_length=500)
-    esg_framework: Optional[ESGFramework] = None
-    esg_category: Optional[ESGCategory] = None
-    document_type: Optional[DocumentType] = None
-    company_id: Optional[str] = None
-    k: int = Field(10, ge=1, le=50)
+    query: str = Field(min_length=1, max_length=1000)
+    esg_framework: str | None = Field(default=None, max_length=80)
+    esg_category: str | None = Field(default=None, max_length=80)
+    document_type: str | None = Field(default=None, max_length=80)
+    company_id: str | None = Field(default=None, max_length=200)
+    k: int = Field(default=10, ge=1, le=100)
     search_strategy: SearchStrategy = SearchStrategy.SIMILARITY
 
+    model_config = ConfigDict(str_strip_whitespace=True)
 
-# Response Models
+    _normalize_framework = field_validator("esg_framework")(_optional_identifier)
+    _normalize_category = field_validator("esg_category")(_optional_identifier)
+    _normalize_type = field_validator("document_type")(_optional_identifier)
+    _normalize_company = field_validator("company_id")(_optional_identifier)
+
+
 class DocumentMetadata(BaseModel):
-    """Document metadata"""
     filename: str
     mime_type: str
     file_size_mb: float
     document_hash: str
-    esg_framework: Optional[str] = None
-    document_type: Optional[str] = None
-    company_id: Optional[str] = None
-    esg_category: Optional[str] = None
+    esg_framework: str | None = None
+    document_type: str | None = None
+    company_id: str | None = None
+    esg_category: str | None = None
     processed_at: str
     chunk_id: str
 
 
 class DocumentResponse(BaseModel):
-    """Document response model"""
     content: str
     metadata: DocumentMetadata
-    retrieval_score: Optional[float] = None
-    retrieval_rank: Optional[int] = None
+    retrieval_score: float | None = None
+    retrieval_rank: int | None = None
 
 
 class RAGResponse(BaseModel):
-    """Response model for RAG queries"""
     answer: str
-    source_documents: List[DocumentResponse]
-    confidence_score: float = Field(..., ge=0.0, le=1.0)
-    retrieval_time_ms: int
-    generation_time_ms: int
-    total_time_ms: int
-    esg_framework: Optional[str] = None
-    esg_categories: Optional[List[str]] = None
-    
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "answer": "According to CSRD requirements, companies must report Scope 1, 2, and 3 carbon emissions...",
-                "source_documents": [],
-                "confidence_score": 0.89,
-                "retrieval_time_ms": 245,
-                "generation_time_ms": 1820,
-                "total_time_ms": 2065,
-                "esg_framework": "CSRD",
-                "esg_categories": ["Environmental"]
-            }
-        }
-    )
+    source_documents: list[DocumentResponse]
+    confidence_score: float = Field(ge=0.0, le=1.0)
+    retrieval_time_ms: int = Field(ge=0)
+    generation_time_ms: int = Field(ge=0)
+    total_time_ms: int = Field(ge=0)
+    esg_framework: str | None = None
+    esg_categories: list[str] = Field(default_factory=list)
 
 
 class DocumentUploadResponse(BaseModel):
-    """Response model for document upload"""
     document_id: str
     filename: str
-    chunks_created: int
-    processing_time_ms: int
+    chunks_created: int = Field(ge=1)
+    processing_time_ms: int = Field(ge=0)
     metadata: DocumentMetadata
 
 
 class BatchDocumentUploadResponse(BaseModel):
-    """Response model for batch document upload"""
     total_documents: int
     successful_uploads: int
     failed_uploads: int
-    document_responses: List[DocumentUploadResponse]
-    errors: List[str]
+    document_responses: list[DocumentUploadResponse]
+    errors: list[str]
     total_processing_time_ms: int
 
 
-class HealthResponse(BaseModel):
-    """Health check response"""
-    status: str
-    timestamp: datetime
-    version: str
-    services: Dict[str, str]  # service_name -> status
-    
-
-class ErrorResponse(BaseModel):
-    """Error response model"""
-    error: str
-    detail: Optional[str] = None
-    error_code: Optional[str] = None
-    timestamp: datetime = Field(default_factory=datetime.now)
-
-
 class SearchResultResponse(BaseModel):
-    """Search result response"""
-    documents: List[DocumentResponse]
+    documents: list[DocumentResponse]
     total_results: int
     search_time_ms: int
     query: str
     search_strategy: str
 
 
-# Analytics Models
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentResponse]
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
+
+
+class DocumentStatsResponse(BaseModel):
+    total_documents: int
+    documents_by_framework: dict[str, int]
+    documents_by_category: dict[str, int]
+    documents_by_type: dict[str, int]
+    total_chunks: int
+    average_chunk_size: int
+    documents: list[dict[str, Any]]
+
+
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: datetime
+    version: str
+    services: dict[str, str]
+
+
+class ErrorResponse(BaseModel):
+    error: str
+    detail: str | None = None
+    error_code: str | None = None
+    request_id: str | None = None
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class UsageStats(BaseModel):
-    """Usage statistics"""
     total_queries: int
     total_documents: int
     average_response_time_ms: float
-    most_used_framework: Optional[str] = None
-    most_queried_category: Optional[str] = None
+    most_used_framework: str | None = None
+    most_queried_category: str | None = None
 
 
 class FrameworkStats(BaseModel):
-    """Framework-specific statistics"""
     framework: str
     query_count: int
     document_count: int
@@ -196,8 +168,7 @@ class FrameworkStats(BaseModel):
 
 
 class AnalyticsResponse(BaseModel):
-    """Analytics response"""
     usage_stats: UsageStats
-    framework_stats: List[FrameworkStats]
+    framework_stats: list[FrameworkStats]
     period_start: datetime
     period_end: datetime

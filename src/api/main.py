@@ -1,404 +1,323 @@
-"""
-Main FastAPI application for ESG Analysis Platform
-"""
-import asyncio
-from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import List, Dict, Any
+"""FastAPI application factory and core RAG endpoints."""
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, BackgroundTasks
+from __future__ import annotations
+
+import json
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import StreamingResponse
-import uvicorn
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.config import settings
-from ..core.logging import configure_logging, get_logger
 from ..core.exceptions import (
-    ESGAnalysisException, DocumentProcessingError, 
-    VectorStoreError, LLMProviderError
+    ConfigurationError,
+    DocumentProcessingError,
+    ESGAnalysisException,
+    LLMProviderError,
+    VectorStoreError,
 )
+from ..core.logging import configure_logging, get_logger
+from ..core.taxonomy import get_taxonomy
+from ..services.analytics_service import analytics_service
 from ..services.document_service import document_service
-from ..services.vector_store_service import vector_store_service
-from ..services.rag_service import rag_service
 from ..services.llm_service import llm_service
-
+from ..services.rag_service import rag_service
+from ..services.vector_store_service import vector_store_service
 from .models import (
-    RAGQueryRequest, RAGResponse, DocumentUploadRequest, DocumentUploadResponse,
-    BatchDocumentUploadResponse, HealthResponse, ErrorResponse, 
-    DocumentSearchRequest, SearchResultResponse, AnalyticsResponse,
-    DocumentResponse, DocumentMetadata
+    DocumentMetadata,
+    DocumentResponse,
+    DocumentUploadResponse,
+    ErrorResponse,
+    HealthResponse,
+    RAGQueryRequest,
+    RAGResponse,
 )
-from .routers import documents, analytics, admin
+from .routers import admin, analytics, documents
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager"""
-    logger = get_logger("app")
-    
-    # Startup
-    logger.info("Starting ESG Analysis Platform")
-    configure_logging()
-    
-    # Initialize services
-    try:
-        # Test LLM service
-        available_providers = llm_service.list_providers()
-        logger.info("LLM providers available", providers=available_providers)
-        
-        # Test vector store
-        # This will initialize the vector store connections
-        logger.info("Vector store service initialized")
-        
-        logger.info("All services initialized successfully")
-    except Exception as e:
-        logger.error("Failed to initialize services", error=str(e))
-        raise
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down ESG Analysis Platform")
-
-
-# Create FastAPI app
-app = FastAPI(
-    title=settings.api_title,
-    version=settings.api_version,
-    description=settings.api_description,
-    lifespan=lifespan,
-    docs_url="/docs" if settings.debug else None,
-    redoc_url="/redoc" if settings.debug else None,
-)
-
-# Add middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-
-# Include routers
-app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
-app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["analytics"])
-app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
-
+configure_logging()
 logger = get_logger("api")
 
 
-# Exception handlers
-@app.exception_handler(ESGAnalysisException)
-async def esg_analysis_exception_handler(request, exc: ESGAnalysisException):
-    return HTTPException(
-        status_code=400,
-        detail=ErrorResponse(
-            error=exc.message,
-            detail=str(exc.details) if exc.details else None,
-            error_code=exc.error_code
-        ).model_dump()
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    taxonomy = get_taxonomy()
+    logger.info(
+        "Starting ESG Analysis Platform",
+        version=settings.api_version,
+        environment=settings.environment,
+        vector_store=settings.vector_store_type,
+        llm_providers=llm_service.list_providers(),
+        frameworks=taxonomy.framework_ids,
+    )
+    yield
+    logger.info("Shutting down ESG Analysis Platform")
+
+
+def _error_response(
+    request: Request,
+    *,
+    status_code: int,
+    error: str,
+    detail: str | None = None,
+    error_code: str | None = None,
+) -> JSONResponse:
+    payload = ErrorResponse(
+        error=error,
+        detail=detail,
+        error_code=error_code,
+        request_id=getattr(request.state, "request_id", None),
+    )
+    return JSONResponse(status_code=status_code, content=payload.model_dump(mode="json"))
+
+
+def _document_response(document, score: float | None = None, rank: int | None = None):
+    metadata = document.metadata
+    return DocumentResponse(
+        content=document.page_content,
+        metadata=DocumentMetadata(
+            filename=str(metadata.get("filename", "unknown")),
+            mime_type=str(metadata.get("mime_type", "application/octet-stream")),
+            file_size_mb=float(metadata.get("file_size_mb", 0.0)),
+            document_hash=str(metadata.get("document_hash", "")),
+            esg_framework=metadata.get("esg_framework"),
+            document_type=metadata.get("document_type"),
+            company_id=metadata.get("company_id"),
+            esg_category=metadata.get("esg_category"),
+            processed_at=str(metadata.get("processed_at", "")),
+            chunk_id=str(metadata.get("chunk_id", "")),
+        ),
+        retrieval_score=score,
+        retrieval_rank=rank,
     )
 
 
-@app.exception_handler(DocumentProcessingError)
-async def document_processing_exception_handler(request, exc: DocumentProcessingError):
-    return HTTPException(
-        status_code=422,
-        detail=ErrorResponse(
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title=settings.api_title,
+        version=settings.api_version,
+        description=settings.api_description,
+        lifespan=lifespan,
+        docs_url="/docs" if settings.docs_enabled else None,
+        redoc_url="/redoc" if settings.docs_enabled else None,
+    )
+
+    if settings.enable_cors and settings.allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.allowed_origins,
+            allow_credentials=settings.cors_allow_credentials,
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+        )
+    if settings.trusted_hosts:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.trusted_hosts)
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+    @app.middleware("http")
+    async def request_context(request: Request, call_next):
+        request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request.state.request_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+    @app.exception_handler(DocumentProcessingError)
+    async def document_error(request: Request, exc: DocumentProcessingError):
+        return _error_response(
+            request,
+            status_code=422,
             error="Document processing failed",
             detail=exc.message,
-            error_code="DOCUMENT_PROCESSING_ERROR"
-        ).model_dump()
-    )
-
-
-@app.exception_handler(VectorStoreError)
-async def vector_store_exception_handler(request, exc: VectorStoreError):
-    return HTTPException(
-        status_code=503,
-        detail=ErrorResponse(
-            error="Vector store service unavailable",
-            detail=exc.message,
-            error_code="VECTOR_STORE_ERROR"
-        ).model_dump()
-    )
-
-
-@app.exception_handler(LLMProviderError)
-async def llm_provider_exception_handler(request, exc: LLMProviderError):
-    return HTTPException(
-        status_code=503,
-        detail=ErrorResponse(
-            error="LLM service unavailable",
-            detail=exc.message,
-            error_code="LLM_PROVIDER_ERROR"
-        ).model_dump()
-    )
-
-
-# Core API endpoints
-@app.get("/", response_model=Dict[str, Any])
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "name": settings.api_title,
-        "version": settings.api_version,
-        "description": settings.api_description,
-        "docs_url": "/docs" if settings.debug else "Disabled in production",
-        "health_check": "/health",
-        "supported_frameworks": settings.esg_frameworks,
-        "supported_categories": settings.esg_categories
-    }
-
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    try:
-        # Check LLM service
-        llm_providers = llm_service.list_providers()
-        llm_status = "healthy" if llm_providers else "unhealthy"
-        
-        # Check vector store (simple check)
-        vector_status = "healthy"  # Assume healthy if no exception
-        
-        services = {
-            "llm_service": llm_status,
-            "vector_store": vector_status,
-            "document_service": "healthy"
-        }
-        
-        overall_status = "healthy" if all(status == "healthy" for status in services.values()) else "unhealthy"
-        
-        return HealthResponse(
-            status=overall_status,
-            timestamp=datetime.now(),
-            version=settings.api_version,
-            services=services
+            error_code=exc.error_code or "DOCUMENT_PROCESSING_ERROR",
         )
-    except Exception as e:
-        logger.error("Health check failed", error=str(e))
-        raise HTTPException(
+
+    async def dependency_error(request: Request, exc: ESGAnalysisException):
+        return _error_response(
+            request,
             status_code=503,
-            detail={"error": "Health check failed", "detail": str(e)}
+            error="A required service is unavailable",
+            detail=exc.message,
+            error_code=exc.error_code or "DEPENDENCY_UNAVAILABLE",
         )
 
+    for exception_type in (VectorStoreError, LLMProviderError, ConfigurationError):
+        app.add_exception_handler(exception_type, dependency_error)
 
-@app.post("/api/v1/query", response_model=RAGResponse)
-async def query_rag(request: RAGQueryRequest):
-    """Main RAG query endpoint"""
-    try:
-        logger.info("Received RAG query", question_length=len(request.question))
-        
+    @app.exception_handler(ESGAnalysisException)
+    async def esg_error(request: Request, exc: ESGAnalysisException):
+        return _error_response(
+            request,
+            status_code=400,
+            error=exc.message,
+            error_code=exc.error_code,
+        )
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception):
+        logger.exception(
+            "Unhandled API error",
+            request_id=request.state.request_id,
+            path=request.url.path,
+            error=str(exc),
+        )
+        return _error_response(
+            request,
+            status_code=500,
+            error="Internal server error",
+            detail="Use the request ID when reporting this error",
+            error_code="INTERNAL_ERROR",
+        )
+
+    app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
+    app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["analytics"])
+    app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
+
+    @app.get("/")
+    async def root() -> dict[str, Any]:
+        taxonomy = get_taxonomy()
+        return {
+            "name": settings.api_title,
+            "version": settings.api_version,
+            "description": settings.api_description,
+            "docs_url": "/docs" if settings.docs_enabled else None,
+            "health_check": "/health",
+            "frameworks": [framework.model_dump() for framework in taxonomy.frameworks],
+            "supported_frameworks": taxonomy.framework_ids,
+            "supported_categories": taxonomy.category_ids,
+            "document_types": taxonomy.document_types,
+            "supported_extensions": list(settings.supported_extensions),
+        }
+
+    @app.get("/health", response_model=HealthResponse)
+    async def health_check() -> HealthResponse:
+        vector_status = await vector_store_service.health()
+        llm_status = "healthy" if llm_service.list_providers() else "not_configured"
+        services = {
+            "api": "healthy",
+            "document_service": "healthy",
+            "vector_store": vector_status,
+            "llm_service": llm_status,
+        }
+        overall = "healthy"
+        if vector_status != "healthy":
+            overall = "unhealthy"
+        elif llm_status != "healthy":
+            overall = "degraded"
+        return HealthResponse(
+            status=overall,
+            timestamp=datetime.now(UTC),
+            version=settings.api_version,
+            services=services,
+        )
+
+    @app.post("/api/v1/query", response_model=RAGResponse)
+    async def query_rag(request: RAGQueryRequest) -> RAGResponse:
+        if request.esg_framework and request.esg_framework not in get_taxonomy().framework_ids:
+            raise HTTPException(status_code=422, detail="Unknown ESG framework")
+
         response = await rag_service.query(
             question=request.question,
             esg_framework=request.esg_framework,
-            search_strategy=request.search_strategy,
+            search_strategy=request.search_strategy.value,
             k=request.k,
-            use_query_decomposition=request.use_query_decomposition
+            use_query_decomposition=request.use_query_decomposition,
         )
-        
-        # Convert to API response format
-        source_docs = []
-        for doc in response.source_documents:
-            metadata = DocumentMetadata(
-                filename=doc.metadata.get("filename", "unknown"),
-                mime_type=doc.metadata.get("mime_type", "unknown"),
-                file_size_mb=doc.metadata.get("file_size_mb", 0.0),
-                document_hash=doc.metadata.get("document_hash", ""),
-                esg_framework=doc.metadata.get("esg_framework"),
-                document_type=doc.metadata.get("document_type"),
-                company_id=doc.metadata.get("company_id"),
-                esg_category=doc.metadata.get("esg_category"),
-                processed_at=doc.metadata.get("processed_at", ""),
-                chunk_id=doc.metadata.get("chunk_id", "")
-            )
-            
-            source_docs.append(DocumentResponse(
-                content=doc.page_content,
-                metadata=metadata,
-                retrieval_score=doc.metadata.get("retrieval_score"),
-                retrieval_rank=doc.metadata.get("retrieval_rank")
-            ))
-        
-        return RAGResponse(
+        api_response = RAGResponse(
             answer=response.answer,
-            source_documents=source_docs,
+            source_documents=[
+                _document_response(
+                    document,
+                    document.metadata.get("retrieval_score"),
+                    document.metadata.get("retrieval_rank"),
+                )
+                for document in response.source_documents
+            ],
             confidence_score=response.confidence_score,
             retrieval_time_ms=response.retrieval_time_ms,
             generation_time_ms=response.generation_time_ms,
             total_time_ms=response.total_time_ms,
             esg_framework=response.esg_framework,
-            esg_categories=response.esg_categories
+            esg_categories=response.esg_categories or [],
         )
-        
-    except Exception as e:
-        logger.error("RAG query failed", error=str(e))
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "Query processing failed", "detail": str(e)}
+        analytics_service.record_query(
+            question=request.question,
+            framework=response.esg_framework,
+            categories=response.esg_categories or [],
+            duration_ms=response.total_time_ms,
+            confidence=response.confidence_score,
         )
+        return api_response
 
-
-@app.post("/api/v1/query/stream")
-async def stream_query_rag(request: RAGQueryRequest):
-    """Streaming RAG query endpoint"""
-    try:
-        logger.info("Received streaming RAG query", question_length=len(request.question))
-        
+    @app.post("/api/v1/query/stream")
+    async def stream_query_rag(request: RAGQueryRequest) -> StreamingResponse:
         async def generate_stream():
             try:
                 async for chunk in rag_service.stream_query(
                     question=request.question,
                     esg_framework=request.esg_framework,
-                    search_strategy=request.search_strategy,
-                    k=request.k
+                    search_strategy=request.search_strategy.value,
+                    k=request.k,
                 ):
-                    yield f"data: {chunk}\n\n"
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                logger.error("Streaming failed", error=str(e))
-                yield f"data: Error: {str(e)}\n\n"
-        
+                    yield f"event: chunk\ndata: {json.dumps({'chunk': chunk})}\n\n"
+                yield "event: done\ndata: {}\n\n"
+            except Exception as exc:
+                logger.exception("Streaming query failed", error=str(exc))
+                yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+
         return StreamingResponse(
             generate_stream(),
-            media_type="text/plain",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
-        )
-        
-    except Exception as e:
-        logger.error("Streaming setup failed", error=str(e))
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "Streaming setup failed", "detail": str(e)}
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-
-@app.post("/api/v1/upload", response_model=DocumentUploadResponse)
-async def upload_document(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
-    esg_framework: str = None,
-    document_type: str = None,
-    company_id: str = None
-):
-    """Upload and process a single document"""
-    logger.info(
-        "Starting document upload",
-        filename=file.filename,
-        content_type=file.content_type,
-        esg_framework=esg_framework,
-        document_type=document_type,
-        company_id=company_id
-    )
-    
-    try:
-        # Read file content
-        logger.info("Reading file content", filename=file.filename)
-        content = await file.read()
-        file_size_bytes = len(content)
-        file_size_mb = file_size_bytes / (1024 * 1024)
-        
-        logger.info(
-            "File content read successfully",
-            filename=file.filename,
-            size_bytes=file_size_bytes,
-            size_mb=round(file_size_mb, 2)
-        )
-        
-        # Process document
-        start_time = datetime.now()
-        logger.info("Starting document processing", filename=file.filename)
-        
-        documents = await document_service.process_uploaded_document(
-            file_content=content,
-            filename=file.filename,
+    @app.post("/api/v1/upload", response_model=DocumentUploadResponse, status_code=201)
+    async def upload_document(
+        file: UploadFile = File(...),
+        esg_framework: str | None = Form(default=None),
+        document_type: str | None = Form(default=None),
+        company_id: str | None = Form(default=None),
+    ) -> DocumentUploadResponse:
+        started = datetime.now(UTC)
+        chunks = await document_service.process_uploaded_document(
+            file_content=await file.read(),
+            filename=file.filename or "",
             esg_framework=esg_framework,
             document_type=document_type,
-            company_id=company_id
+            company_id=company_id,
         )
-        
-        processing_time = (datetime.now() - start_time).total_seconds() * 1000
-        
-        logger.info(
-            "Document processing completed",
-            filename=file.filename,
-            chunks_created=len(documents),
-            processing_time_ms=int(processing_time)
+        await vector_store_service.add_documents(chunks)
+        elapsed_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
+        first_chunk = chunks[0]
+        return DocumentUploadResponse(
+            document_id=str(first_chunk.metadata["document_hash"]),
+            filename=str(first_chunk.metadata["filename"]),
+            chunks_created=len(chunks),
+            processing_time_ms=elapsed_ms,
+            metadata=_document_response(first_chunk).metadata,
         )
-        
-        # Add to vector store in background
-        async def add_to_vector_store():
-            try:
-                logger.info("Adding documents to vector store", filename=file.filename, count=len(documents))
-                await vector_store_service.add_documents(documents)
-                logger.info("Documents successfully added to vector store", filename=file.filename, count=len(documents))
-            except Exception as e:
-                logger.error("Failed to add documents to vector store", filename=file.filename, error=str(e), error_type=type(e).__name__)
-        
-        background_tasks.add_task(add_to_vector_store)
-        
-        # Create response
-        first_doc = documents[0]
-        logger.info(
-            "Creating response metadata",
-            filename=file.filename,
-            document_hash=first_doc.metadata.get("document_hash", "")[:8] + "..."
-        )
-        
-        metadata = DocumentMetadata(
-            filename=first_doc.metadata["filename"],
-            mime_type=first_doc.metadata["mime_type"],
-            file_size_mb=first_doc.metadata["file_size_mb"],
-            document_hash=first_doc.metadata["document_hash"],
-            esg_framework=first_doc.metadata.get("esg_framework"),
-            document_type=first_doc.metadata.get("document_type"),
-            company_id=first_doc.metadata.get("company_id"),
-            esg_category=first_doc.metadata.get("esg_category"),
-            processed_at=first_doc.metadata["processed_at"],
-            chunk_id=first_doc.metadata["chunk_id"]
-        )
-        
-        response = DocumentUploadResponse(
-            document_id=first_doc.metadata["document_hash"],
-            filename=file.filename,
-            chunks_created=len(documents),
-            processing_time_ms=int(processing_time),
-            metadata=metadata
-        )
-        
-        logger.info(
-            "Document upload completed successfully",
-            filename=file.filename,
-            document_id=first_doc.metadata["document_hash"][:8] + "...",
-            total_time_ms=int(processing_time)
-        )
-        
-        return response
-        
-    except Exception as e:
-        logger.error(
-            "Document upload failed",
-            filename=file.filename,
-            error=str(e),
-            error_type=type(e).__name__,
-            esg_framework=esg_framework
-        )
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "Document upload failed", "detail": str(e)}
-        )
+
+    return app
+
+
+app = create_app()
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     uvicorn.run(
         "src.api.main:app",
         host=settings.host,
         port=settings.port,
         reload=settings.reload,
-        workers=settings.workers if not settings.reload else 1,
-        log_level="debug" if settings.debug else "info"
+        workers=1 if settings.reload else settings.workers,
+        log_level=settings.log_level.lower(),
     )
