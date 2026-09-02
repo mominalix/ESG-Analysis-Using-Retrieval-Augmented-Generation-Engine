@@ -50,7 +50,7 @@ ui = [
   "streamlit>=1.61.1,<2",
   "requests>=2.34.2,<3",
   "pandas>=3.0.5,<4",
-  "plotly>=6.9.0,<7",
+  "plotly>=6.9.0,<8",
   "reportlab>=5.0.0,<6",
 ]
 dev = [
